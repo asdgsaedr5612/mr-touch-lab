@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MR Touch Lab</title>
+<style>
+  :root { --bg:#14181d; --panel:rgba(22,27,33,.88); --fg:#e9edf1; --muted:#9aa7b4; --accent:#e0a23c; --line:rgba(255,255,255,.12); }
+  html, body { height:100%; margin:0; background:var(--bg); color:var(--fg);
+    font-family:"Segoe UI","Hiragino Sans","Yu Gothic UI","Noto Sans JP",sans-serif; overflow:hidden; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+  #panel { position:fixed; left:16px; bottom:16px; max-width:min(400px, calc(100vw - 32px)); box-sizing:border-box;
+    background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px 20px;
+    display:flex; flex-direction:column; gap:12px; backdrop-filter:blur(6px); }
+  h1 { font-size:20px; margin:0; letter-spacing:.02em; }
+  p, li { font-size:13.5px; line-height:1.65; margin:0; color:var(--muted); }
+  ul { margin:0; padding-left:1.2em; display:flex; flex-direction:column; gap:2px; }
+  b { color:var(--fg); font-weight:600; }
+  button { font:inherit; font-size:16px; font-weight:700; padding:12px 18px; border-radius:8px; border:0;
+    background:var(--accent); color:#1b1408; cursor:pointer; }
+  button:disabled { background:#48505a; color:#aab3bd; cursor:not-allowed; }
+  button:focus-visible { outline:3px solid #fff; outline-offset:2px; }
+  #status { font-size:12.5px; color:var(--muted); }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+  "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+} }
+</script>
+</head>
+<body>
+<div id="panel">
+  <h1>MR Touch Lab</h1>
+  <p>現実の机や床の上で、積み木・鋼球・ゴムボール・真鍮の分銅・サイコロを手でつかんで動かせます。</p>
+  <ul>
+    <li><b>つかむ</b>：親指と人差し指でつまむ（コントローラーはグリップかトリガー）</li>
+    <li><b>押す・はじく</b>：指先でそのまま触る</li>
+    <li><b>投げる</b>：つまんだまま振って離す</li>
+    <li><b>並べ直す</b>：両手のつまみを胸の前で合わせる（コントローラーは A / X）</li>
+  </ul>
+  <button id="start" disabled>MR を開始</button>
+  <div id="status">WebXR を確認中…</div>
+  <p>この画面ではマウスのドラッグで物を動かして試せます。</p>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import * as CANNON from 'cannon-es';
+
+/* ---------- 基本セットアップ ---------- */
+const G_OBJ = 1, G_HAND = 2, G_STATIC = 4;
+const DESKTOP_BG = new THREE.Color(0x14181d);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = DESKTOP_BG;
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.02, 50);
+camera.position.set(0, 1.28, 0.8);
+camera.lookAt(0, 0.76, 0);
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x888888, 0.6));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -1.2; sun.shadow.camera.right = 1.2;
+sun.shadow.camera.top = 1.2; sun.shadow.camera.bottom = -1.2;
+sun.shadow.camera.near = 0.1; sun.shadow.camera.far = 6;
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.01;
+scene.add(sun, sun.target);
+
+const shadowMat = new THREE.ShadowMaterial({ opacity: 0.38 });
+const floorCatcher = new THREE.Mesh(new THREE.PlaneGeometry(8, 8).rotateX(-Math.PI / 2), shadowMat);
+floorCatcher.position.y = 0.001;
+floorCatcher.receiveShadow = true;
+scene.add(floorCatcher);
+
+/* ---------- 物理ワールド ---------- */
+const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+world.allowSleep = true;
+world.solver.iterations = 14;
+const matDefault = new CANNON.Material('default');
+const matRubber = new CANNON.Material('rubber');
+const matSteel = new CANNON.Material('steel');
+world.defaultContactMaterial.friction = 0.45;
+world.defaultContactMaterial.restitution = 0.25;
+world.addContactMaterial(new CANNON.ContactMaterial(matDefault, matDefault, { friction: 0.45, restitution: 0.25 }));
+world.addContactMaterial(new CANNON.ContactMaterial(matRubber, matDefault, { friction: 0.9, restitution: 0.8 }));
+world.addContactMaterial(new CANNON.ContactMaterial(matRubber, matSteel, { friction: 0.9, restitution: 0.8 }));
+world.addContactMaterial(new CANNON.ContactMaterial(matRubber, matRubber, { friction: 0.9, restitution: 0.8 }));
+world.addContactMaterial(new CANNON.ContactMaterial(matSteel, matDefault, { friction: 0.3, restitution: 0.45 }));
+world.addContactMaterial(new CANNON.ContactMaterial(matSteel, matSteel, { friction: 0.2, restitution: 0.75 }));
+
+const floorBody = new CANNON.Body({ type: CANNON.Body.STATIC, material: matDefault,
+  collisionFilterGroup: G_STATIC, collisionFilterMask: G_OBJ });
+floorBody.addShape(new CANNON.Plane());
+floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+world.addBody(floorBody);
+
+/* ---------- テクスチャ ---------- */
+function woodTexture(seed) {
+  let s = seed * 9301 + 49297;
+  const rnd = () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
+  const c = document.createElement('canvas'); c.width = c.height = 512;
+  const g = c.getContext('2d');
+  g.fillStyle = '#c99a62'; g.fillRect(0, 0, 512, 512);
+  for (let i = 0; i < 140; i++) {
+    const y0 = rnd() * 512, amp = 2 + rnd() * 7, f = 0.004 + rnd() * 0.01, ph = rnd() * 6.28;
+    g.strokeStyle = `rgba(${90 + rnd() * 50 | 0},${55 + rnd() * 30 | 0},${25 + rnd() * 20 | 0},${0.06 + rnd() * 0.22})`;
+    g.lineWidth = 0.6 + rnd() * 2.4;
+    g.beginPath();
+    for (let x = 0; x <= 512; x += 8) {
+      const y = y0 + Math.sin(x * f + ph) * amp;
+      if (x === 0) g.moveTo(x, y); else g.lineTo(x, y);
+    }
+    g.stroke();
+  }
+  for (let i = 0; i < 2600; i++) {
+    g.fillStyle = `rgba(60,35,15,${rnd() * 0.12})`;
+    g.fillRect(rnd() * 512, rnd() * 512, 1 + rnd() * 6, 1);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4;
+  return t;
+}
+function dieFace(n) {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d');
+  g.fillStyle = '#f4f1ea'; g.fillRect(0, 0, 128, 128);
+  const P = { 1: [[1, 1]], 2: [[0, 0], [2, 2]], 3: [[0, 0], [1, 1], [2, 2]], 4: [[0, 0], [2, 0], [0, 2], [2, 2]],
+    5: [[0, 0], [2, 0], [1, 1], [0, 2], [2, 2]], 6: [[0, 0], [2, 0], [0, 1], [2, 1], [0, 2], [2, 2]] }[n];
+  g.fillStyle = n === 1 ? '#c0281f' : '#16181b';
+  for (const [x, y] of P) { g.beginPath(); g.arc(32 + x * 32, 32 + y * 32, n === 1 ? 17 : 11, 0, 6.3); g.fill(); }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4;
+  return t;
+}
+
+/* ---------- 物体 ---------- */
+const items = [];
+function addItem(mesh, shape, mass, kind, material) {
+  mesh.castShadow = true; mesh.receiveShadow = true;
+  scene.add(mesh);
+  const body = new CANNON.Body({ mass, material: material || matDefault,
+    collisionFilterGroup: G_OBJ, collisionFilterMask: G_OBJ | G_HAND | G_STATIC,
+    linearDamping: 0.03, angularDamping: 0.12 });
+  body.addShape(shape);
+  body.sleepSpeedLimit = 0.06; body.sleepTimeLimit = 0.6;
+  world.addBody(body);
+  if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
+  const item = { mesh, body, kind, radius: mesh.geometry.boundingSphere.radius, heldBy: null, lastSound: 0 };
+  mesh.userData.item = item;
+  body.addEventListener('collide', (e) => {
+    const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
+    const now = performance.now();
+    if (v < 0.18 || now - item.lastSound < 70) return;
+    item.lastSound = now;
+    playImpact(kind, v, body.position);
+  });
+  items.push(item);
+  return item;
+}
+
+const woodTints = [0xffffff, 0xf0d2a8, 0xd9a877, 0xffe2b8];
+function woodBlock(w, h, d, i) {
+  const mat = new THREE.MeshStandardMaterial({ map: woodTexture(i + 1), color: woodTints[i % woodTints.length], roughness: 0.62, metalness: 0 });
+  const mesh = new THREE.Mesh(new RoundedBoxGeometry(w, h, d, 4, 0.004), mat);
+  addItem(mesh, new CANNON.Box(new CANNON.Vec3(w / 2, h / 2, d / 2)), 620 * w * h * d, 'wood');
+}
+for (let i = 0; i < 4; i++) woodBlock(0.06, 0.06, 0.06, i);
+woodBlock(0.12, 0.03, 0.06, 4);
+woodBlock(0.12, 0.03, 0.06, 5);
+woodBlock(0.18, 0.03, 0.06, 6);
+
+const steelMat = new THREE.MeshStandardMaterial({ color: 0xdfe3e8, metalness: 1, roughness: 0.07 });
+for (let i = 0; i < 3; i++) {
+  const r = 0.022;
+  addItem(new THREE.Mesh(new THREE.SphereGeometry(r, 48, 32), steelMat), new CANNON.Sphere(r), 0.35, 'steel', matSteel);
+}
+{
+  const r = 0.035;
+  const mat = new THREE.MeshStandardMaterial({ color: 0xc8322b, roughness: 0.85, metalness: 0 });
+  addItem(new THREE.Mesh(new THREE.SphereGeometry(r, 48, 32), mat), new CANNON.Sphere(r), 0.09, 'rubber', matRubber);
+}
+{
+  const r = 0.024, h = 0.05;
+  const mat = new THREE.MeshStandardMaterial({ color: 0xd9a441, metalness: 1, roughness: 0.22 });
+  addItem(new THREE.Mesh(new THREE.CylinderGeometry(r, r, h, 48), mat), new CANNON.Cylinder(r, r, h, 20), 0.75, 'brass', matSteel);
+}
+for (let i = 0; i < 2; i++) {
+  const s = 0.03;
+  const mats = [1, 6, 2, 5, 3, 4].map((n) => new THREE.MeshPhysicalMaterial({ map: dieFace(n), roughness: 0.28, clearcoat: 0.7, clearcoatRoughness: 0.15 }));
+  addItem(new THREE.Mesh(new RoundedBoxGeometry(s, s, s, 4, 0.004), mats), new CANNON.Box(new CANNON.Vec3(s / 2, s / 2, s / 2)), 0.03, 'plastic');
+}
+
+/* ---------- 仮想テーブル（現実の机が見つからないとき用） ---------- */
+const TABLE_W = 0.8, TABLE_D = 0.5, TABLE_T = 0.04;
+const table = new THREE.Group();
+{
+  const top = new THREE.Mesh(new RoundedBoxGeometry(TABLE_W, TABLE_T, TABLE_D, 4, 0.008),
+    new THREE.MeshStandardMaterial({ map: woodTexture(77), color: 0x9a6b43, roughness: 0.5 }));
+  top.position.y = -TABLE_T / 2; top.castShadow = true; top.receiveShadow = true;
+  const legMat = new THREE.MeshStandardMaterial({ color: 0x2b2f35, metalness: 0.9, roughness: 0.35 });
+  const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 1, 32), legMat);
+  leg.name = 'leg'; leg.castShadow = true;
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.24, 0.02, 48), legMat);
+  base.name = 'base'; base.castShadow = true; base.receiveShadow = true;
+  table.add(top, leg, base);
+  scene.add(table);
+}
+const tableBody = new CANNON.Body({ type: CANNON.Body.STATIC, material: matDefault,
+  collisionFilterGroup: G_STATIC, collisionFilterMask: G_OBJ });
+tableBody.addShape(new CANNON.Box(new CANNON.Vec3(TABLE_W / 2, TABLE_T / 2, TABLE_D / 2)));
+world.addBody(tableBody);
+
+function setTable(center, yaw, topY) {
+  if (!center) {
+    table.visible = false; tableBody.position.set(0, -50, 0);
+  } else {
+    table.visible = true;
+    table.position.set(center.x, topY, center.z); table.rotation.set(0, yaw, 0);
+    const leg = table.getObjectByName('leg'), base = table.getObjectByName('base');
+    const legLen = Math.max(0.05, topY - TABLE_T - 0.02);
+    leg.scale.y = legLen; leg.position.y = -TABLE_T - legLen / 2;
+    base.position.y = -topY + 0.01;
+    tableBody.position.set(center.x, topY - TABLE_T / 2, center.z);
+    tableBody.quaternion.setFromEuler(0, yaw, 0);
+  }
+  tableBody.aabbNeedsUpdate = true;
+}
+
+/* ---------- 配置 ---------- */
+const play = { center: new THREE.Vector3(0, 0, 0), yaw: 0, surfaceY: 0.76 };
+function placeOne(item, i, n) {
+  const cols = 5, col = i % cols, row = Math.floor(i / cols);
+  const lx = (col - (cols - 1) / 2) * 0.1 + (Math.random() - 0.5) * 0.01;
+  const lz = (row - 1) * 0.1 + (Math.random() - 0.5) * 0.01;
+  const c = Math.cos(play.yaw), s = Math.sin(play.yaw);
+  const b = item.body;
+  b.position.set(play.center.x + lx * c + lz * s, play.surfaceY + 0.06 + (i % 3) * 0.04, play.center.z - lx * s + lz * c);
+  b.quaternion.setFromEuler(0, play.yaw + (Math.random() - 0.5) * 0.6, 0);
+  b.velocity.set(0, 0, 0); b.angularVelocity.set(0, 0, 0);
+  b.wakeUp();
+}
+function placeAll() {
+  items.forEach((it, i) => { if (!it.heldBy) placeOne(it, i, items.length); });
+  sun.position.set(play.center.x + 0.45, play.surfaceY + 2.2, play.center.z + 0.35);
+  sun.target.position.set(play.center.x, play.surfaceY, play.center.z);
+  floorCatcher.position.x = play.center.x; floorCatcher.position.z = play.center.z;
+}
+function setupDesktop() {
+  play.center.set(0, 0, 0); play.yaw = 0; play.surfaceY = 0.76;
+  setTable(play.center, 0, play.surfaceY);
+  placeAll();
+}
+const _head = new THREE.Vector3(), _fwd = new THREE.Vector3();
+function respawnXR() {
+  camera.getWorldPosition(_head);
+  camera.getWorldDirection(_fwd); _fwd.y = 0;
+  if (_fwd.lengthSq() < 1e-4) _fwd.set(0, 0, -1);
+  _fwd.normalize();
+  play.center.set(_head.x + _fwd.x * 0.45, 0, _head.z + _fwd.z * 0.45);
+  play.yaw = Math.atan2(-_fwd.x, -_fwd.z);
+  setTable(null);
+  // 目の前に現実の机（検出済みの面）があるか真下へレイを飛ばして調べる
+  const res = new CANNON.RaycastResult();
+  const from = new CANNON.Vec3(play.center.x, Math.max(0.5, _head.y - 0.15), play.center.z);
+  const to = new CANNON.Vec3(play.center.x, -0.2, play.center.z);
+  world.raycastClosest(from, to, { collisionFilterGroup: G_OBJ, collisionFilterMask: G_STATIC, skipBackfaces: false }, res);
+  if (res.hasHit && res.hitPointWorld.y > 0.35) {
+    play.surfaceY = res.hitPointWorld.y;
+  } else {
+    play.surfaceY = THREE.MathUtils.clamp(_head.y - 0.5, 0.45, 1.0);
+    setTable(play.center, play.yaw, play.surfaceY);
+  }
+  placeAll();
+}
+
+/* ---------- つかむ処理（手・コントローラー・マウス共通） ---------- */
+function makeHolder() { return { item: null, offset: new THREE.Matrix4(), frame: new THREE.Matrix4(), active: false, hist: [] }; }
+const holders = { left: makeHolder(), right: makeHolder(), mouse: makeHolder() };
+const _m = new THREE.Matrix4(), _p = new THREE.Vector3(), _q = new THREE.Quaternion(), _s = new THREE.Vector3();
+const _qc = new THREE.Quaternion(), _v = new THREE.Vector3();
+
+function nearestItem(point, reach) {
+  let best = null, bd = Infinity;
+  for (const it of items) {
+    if (it.heldBy) continue;
+    const d = _v.set(it.body.position.x, it.body.position.y, it.body.position.z).distanceTo(point) - it.radius;
+    if (d < reach && d < bd) { bd = d; best = it; }
+  }
+  return best;
+}
+function beginHold(h, item) {
+  h.item = item; item.heldBy = h; h.hist.length = 0;
+  const b = item.body;
+  _m.compose(_p.set(b.position.x, b.position.y, b.position.z), _q.set(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w), _s.set(1, 1, 1));
+  h.offset.copy(h.frame).invert().multiply(_m);
+  b.collisionFilterMask = G_OBJ | G_STATIC;   // つかんでいる間は手の当たり判定を外す
+  b.allowSleep = false; b.wakeUp();
+}
+function endHold(h) {
+  const item = h.item; if (!item) return;
+  const b = item.body;
+  if (h.hist.length >= 2) {
+    const a = h.hist[0], z = h.hist[h.hist.length - 1], dt = (z.t - a.t) / 1000;
+    if (dt > 0.01) {
+      _v.copy(z.p).sub(a.p).divideScalar(dt).clampLength(0, 12);
+      b.velocity.set(_v.x, _v.y, _v.z);
+    }
+  }
+  b.allowSleep = true;
+  item.heldBy = null; h.item = null;
+  setTimeout(() => { if (!item.heldBy) b.collisionFilterMask = G_OBJ | G_HAND | G_STATIC; }, 250);
+}
+function driveHeld(h, dt, now) {
+  _m.multiplyMatrices(h.frame, h.offset).decompose(_p, _q, _s);
+  const b = h.item.body;
+  _v.set(_p.x - b.position.x, _p.y - b.position.y, _p.z - b.position.z).multiplyScalar(0.85 / dt).clampLength(0, 12);
+  b.velocity.set(_v.x, _v.y, _v.z);
+  _qc.set(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w).invert();
+  _q.multiply(_qc);
+  if (_q.w < 0) { _q.x = -_q.x; _q.y = -_q.y; _q.z = -_q.z; _q.w = -_q.w; }
+  const sn = Math.sqrt(Math.max(0, 1 - _q.w * _q.w));
+  if (sn > 1e-4) {
+    const k = Math.min(40, 2 * Math.acos(Math.min(1, _q.w)) * 0.85 / dt) / sn;
+    b.angularVelocity.set(_q.x * k, _q.y * k, _q.z * k);
+  } else b.angularVelocity.set(0, 0, 0);
+  _p.setFromMatrixPosition(h.frame);
+  h.hist.push({ t: now, p: _p.clone() });
+  while (h.hist.length > 2 && now - h.hist[0].t > 90) h.hist.shift();
+}
+
+/* ---------- 手のトラッキング ---------- */
+const FINGERS = ['thumb', 'index-finger', 'middle-finger', 'ring-finger', 'pinky-finger'];
+const JOINTS = ['wrist'];
+const CHAINS = [];
+for (const f of FINGERS) {
+  const seg = f === 'thumb' ? ['metacarpal', 'phalanx-proximal', 'phalanx-distal', 'tip']
+    : ['metacarpal', 'phalanx-proximal', 'phalanx-intermediate', 'phalanx-distal', 'tip'];
+  const names = seg.map((s) => f + '-' + s);
+  JOINTS.push(...names);
+  const chain = ['wrist', ...names];
+  for (let i = 0; i < chain.length - 1; i++) CHAINS.push([chain[i], chain[i + 1]]);
+}
+for (let i = 1; i < 4; i++) {
+  CHAINS.push([FINGERS[i] + '-phalanx-proximal', FINGERS[i + 1] + '-phalanx-proximal']);
+  CHAINS.push([FINGERS[i] + '-metacarpal', FINGERS[i + 1] + '-metacarpal']);
+}
+CHAINS.push(['thumb-metacarpal', 'index-finger-metacarpal']);
+const COLLIDER_JOINTS = JOINTS.filter((n) => n !== 'wrist' && !n.endsWith('metacarpal'));
+
+// 現実の手を仮想物体の手前に見せるための「色を描かない」遮蔽メッシュ。影は落とす。
+const occMat = new THREE.MeshBasicMaterial({ colorWrite: false });
+const unitSphere = new THREE.SphereGeometry(1, 12, 8), unitCyl = new THREE.CylinderGeometry(1, 1, 1, 10, 1, true);
+const UP = new THREE.Vector3(0, 1, 0);
+
+function makeHand() {
+  const H = { tracked: false, joints: {}, wristQ: new THREE.Quaternion(), group: new THREE.Group(),
+    spheres: {}, bones: [], colliders: [], palm: null, ctrl: null, pinch: new THREE.Vector3(), cooldown: 0 };
+  H.group.visible = false; scene.add(H.group);
+  for (const n of JOINTS) {
+    H.joints[n] = { p: new THREE.Vector3(), r: 0.009 };
+    const m = new THREE.Mesh(unitSphere, occMat); m.renderOrder = -10; m.castShadow = true;
+    H.spheres[n] = m; H.group.add(m);
+  }
+  for (const [a, b] of CHAINS) {
+    const m = new THREE.Mesh(unitCyl, occMat); m.renderOrder = -10; m.castShadow = true;
+    H.bones.push({ a, b, m }); H.group.add(m);
+  }
+  const kin = (r) => {
+    const body = new CANNON.Body({ type: CANNON.Body.KINEMATIC, material: matDefault,
+      collisionFilterGroup: G_HAND, collisionFilterMask: G_OBJ });
+    body.addShape(new CANNON.Sphere(r)); body.position.set(0, -10, 0); world.addBody(body);
+    return body;
+  };
+  for (const n of COLLIDER_JOINTS) H.colliders.push({ n, body: kin(n.startsWith('thumb') ? 0.0105 : 0.0085) });
+  H.palm = kin(0.027);
+  H.ctrl = kin(0.04);
+  return H;
+}
+const hands = { left: makeHand(), right: makeHand() };
+
+function moveKinematic(body, target, dt) {
+  if (!target) { body.position.set(0, -10, 0); body.velocity.set(0, 0, 0); return; }
+  const dx = target.x - body.position.x, dy = target.y - body.position.y, dz = target.z - body.position.z;
+  if (dx * dx + dy * dy + dz * dz > 0.09) {      // 飛びすぎたら瞬間移動
+    body.position.set(target.x, target.y, target.z); body.velocity.set(0, 0, 0);
+  } else body.velocity.set(dx / dt, dy / dt, dz / dt);
+}
+
+const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _mid = new THREE.Vector3();
+function updateHandSource(src, frame, ref, dt, now) {
+  const side = src.handedness; const H = hands[side]; if (!H) return;
+  const h = holders[side];
+  let grabbing = false, haveFrame = false;
+
+  if (src.hand) {
+    let ok = true;
+    for (const n of JOINTS) {
+      const space = src.hand.get(n); const jp = space && frame.getJointPose(space, ref);
+      if (!jp) { ok = false; break; }
+      const t = jp.transform.position; const J = H.joints[n];
+      J.p.set(t.x, t.y, t.z); if (jp.radius) J.r = jp.radius;
+      if (n === 'wrist') { const o = jp.transform.orientation; H.wristQ.set(o.x, o.y, o.z, o.w); }
+    }
+    H.tracked = ok;
+    if (ok) {
+      for (const n of JOINTS) { const J = H.joints[n], m = H.spheres[n]; m.position.copy(J.p); m.scale.setScalar(J.r); }
+      for (const bn of H.bones) {
+        const A = H.joints[bn.a], B = H.joints[bn.b];
+        _a.copy(B.p).sub(A.p); const len = _a.length();
+        bn.m.position.copy(A.p).addScaledVector(_a, 0.5);
+        if (len > 1e-5) bn.m.quaternion.setFromUnitVectors(UP, _a.divideScalar(len));
+        const r = (A.r + B.r) / 2; bn.m.scale.set(r, len, r);
+      }
+      for (const c of H.colliders) moveKinematic(c.body, H.joints[c.n].p, dt);
+      _mid.copy(H.joints['wrist'].p).lerp(H.joints['middle-finger-phalanx-proximal'].p, 0.6);
+      moveKinematic(H.palm, _mid, dt);
+      moveKinematic(H.ctrl, null, dt);
+      const tt = H.joints['thumb-tip'].p, it = H.joints['index-finger-tip'].p;
+      const d = tt.distanceTo(it);
+      grabbing = h.active ? d < 0.045 : d < 0.022;
+      H.pinch.copy(tt).lerp(it, 0.5);
+      h.frame.compose(H.pinch, H.wristQ, _s.set(1, 1, 1));
+      haveFrame = true;
+    }
+    H.group.visible = ok;
+  } else if (src.gripSpace) {
+    const pose = frame.getPose(src.gripSpace, ref);
+    H.group.visible = false;
+    for (const c of H.colliders) moveKinematic(c.body, null, dt);
+    moveKinematic(H.palm, null, dt);
+    H.tracked = !!pose;
+    if (pose) {
+      const t = pose.transform.position, o = pose.transform.orientation;
+      H.pinch.set(t.x, t.y, t.z);
+      h.frame.compose(H.pinch, _q.set(o.x, o.y, o.z, o.w), _s.set(1, 1, 1));
+      haveFrame = true;
+      moveKinematic(H.ctrl, h.item ? null : H.pinch, dt);
+      const gp = src.gamepad;
+      if (gp) {
+        grabbing = !!((gp.buttons[0] && gp.buttons[0].pressed) || (gp.buttons[1] && gp.buttons[1].pressed));
+        if (gp.buttons[4] && gp.buttons[4].pressed && now > resetCooldown) { resetCooldown = now + 2000; respawnXR(); }
+      }
+    } else moveKinematic(H.ctrl, null, dt);
+  }
+  H.seen = true;
+
+  if (haveFrame && grabbing && !h.active) {
+    const it = nearestItem(H.pinch, src.hand ? 0.035 : 0.06);
+    if (it) {
+      beginHold(h, it);
+      const act = src.gamepad && src.gamepad.hapticActuators && src.gamepad.hapticActuators[0];
+      if (act && act.pulse) act.pulse(0.5, 40);
+    }
+  }
+  if ((!grabbing || !haveFrame) && h.item) endHold(h);
+  h.active = haveFrame && grabbing;
+}
+
+let resetCooldown = 0;
+function updateInputs(frame, ref, dt, now) {
+  hands.left.seen = hands.right.seen = false;
+  for (const src of frame.session.inputSources) updateHandSource(src, frame, ref, dt, now);
+  for (const side of ['left', 'right']) {
+    const H = hands[side];
+    if (!H.seen) {
+      H.tracked = false; H.group.visible = false;
+      for (const c of H.colliders) moveKinematic(c.body, null, dt);
+      moveKinematic(H.palm, null, dt); moveKinematic(H.ctrl, null, dt);
+      if (holders[side].item) endHold(holders[side]);
+      holders[side].active = false;
+    }
+  }
+  // 両手のつまみを合わせたら並べ直し
+  const L = holders.left, R = holders.right;
+  if (L.active && R.active && !L.item && !R.item && hands.left.tracked && hands.right.tracked &&
+      hands.left.pinch.distanceTo(hands.right.pinch) < 0.06 && now > resetCooldown) {
+    resetCooldown = now + 3000; respawnXR();
+  }
+}
+
+/* ---------- 現実の面（机・床・壁）の検出 ---------- */
+const planes = new Map();
+function dropPlane(pl) {
+  const rec = planes.get(pl); if (!rec) return;
+  world.removeBody(rec.body); scene.remove(rec.mesh); rec.mesh.geometry.dispose(); planes.delete(pl);
+}
+function clearPlanes() { for (const pl of [...planes.keys()]) dropPlane(pl); }
+function updatePlanes(frame, ref) {
+  const dp = frame.detectedPlanes; if (!dp) return;
+  for (const pl of [...planes.keys()]) if (!dp.has(pl)) dropPlane(pl);
+  dp.forEach((pl) => {
+    const pose = frame.getPose(pl.planeSpace, ref); if (!pose) return;
+    let rec = planes.get(pl);
+    if (!rec || rec.t !== pl.lastChangedTime) {
+      if (rec) dropPlane(pl);
+      let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+      for (const pt of pl.polygon) { x0 = Math.min(x0, pt.x); x1 = Math.max(x1, pt.x); z0 = Math.min(z0, pt.z); z1 = Math.max(z1, pt.z); }
+      const w = Math.max(0.02, x1 - x0), d = Math.max(0.02, z1 - z0), cx = (x0 + x1) / 2, cz = (z0 + z1) / 2;
+      const body = new CANNON.Body({ type: CANNON.Body.STATIC, material: matDefault,
+        collisionFilterGroup: G_STATIC, collisionFilterMask: G_OBJ });
+      body.addShape(new CANNON.Box(new CANNON.Vec3(w / 2, 0.05, d / 2)), new CANNON.Vec3(cx, -0.05, cz));
+      world.addBody(body);
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, d).rotateX(-Math.PI / 2).translate(cx, 0.002, cz), shadowMat);
+      mesh.receiveShadow = true; scene.add(mesh);
+      rec = { body, mesh, t: pl.lastChangedTime }; planes.set(pl, rec);
+    }
+    const p = pose.transform.position, o = pose.transform.orientation;
+    rec.body.position.set(p.x, p.y, p.z); rec.body.quaternion.set(o.x, o.y, o.z, o.w); rec.body.aabbNeedsUpdate = true;
+    rec.mesh.position.set(p.x, p.y, p.z); rec.mesh.quaternion.set(o.x, o.y, o.z, o.w);
+    rec.mesh.visible = !(pl.orientation === 'horizontal' && Math.abs(p.y) < 0.06);  // 床は floorCatcher が担当
+  });
+}
+
+/* ---------- 衝突音 ---------- */
+let actx = null, noiseBuf = null;
+const SOUND = {
+  wood:    { f: [640, 1510], decay: 0.06, tone: 0.5, noise: 0.9, nf: 1900 },
+  steel:   { f: [3150, 5320, 7450], decay: 0.45, tone: 0.5, noise: 0.25, nf: 6000 },
+  brass:   { f: [1880, 3340, 4790], decay: 0.3, tone: 0.5, noise: 0.3, nf: 4000 },
+  rubber:  { f: [135], decay: 0.08, tone: 0.9, noise: 0.25, nf: 420 },
+  plastic: { f: [2500], decay: 0.025, tone: 0.3, noise: 1.0, nf: 3600 },
+};
+function initAudio() {
+  if (actx) { actx.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+  actx = new AC();
+  noiseBuf = actx.createBuffer(1, actx.sampleRate * 0.1, actx.sampleRate);
+  const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+}
+function playImpact(kind, v, pos) {
+  if (!actx || actx.state !== 'running') return;
+  const S = SOUND[kind], t = actx.currentTime;
+  const vol = Math.min(1, 0.05 * v * v + 0.12 * v);
+  const pan = actx.createPanner();
+  pan.panningModel = 'HRTF'; pan.distanceModel = 'inverse'; pan.refDistance = 0.4; pan.rolloffFactor = 1.2;
+  if (pan.positionX) { pan.positionX.value = pos.x; pan.positionY.value = pos.y; pan.positionZ.value = pos.z; }
+  else pan.setPosition(pos.x, pos.y, pos.z);
+  pan.connect(actx.destination);
+  S.f.forEach((f, i) => {
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.frequency.value = f * (0.97 + Math.random() * 0.06);
+    g.gain.setValueAtTime(vol * S.tone / (i + 1), t);
+    g.gain.exponentialRampToValueAtTime(0.0005, t + S.decay / (1 + i * 0.4));
+    o.connect(g).connect(pan); o.start(t); o.stop(t + S.decay + 0.02);
+  });
+  const n = actx.createBufferSource(), bp = actx.createBiquadFilter(), g = actx.createGain();
+  n.buffer = noiseBuf; bp.type = 'bandpass'; bp.frequency.value = S.nf; bp.Q.value = 0.8;
+  g.gain.setValueAtTime(vol * S.noise, t); g.gain.exponentialRampToValueAtTime(0.0005, t + 0.035);
+  n.connect(bp).connect(g).connect(pan); n.start(t); n.stop(t + 0.05);
+}
+function updateListener() {
+  if (!actx) return;
+  const L = actx.listener;
+  camera.getWorldPosition(_a); camera.getWorldDirection(_b);
+  if (L.positionX) {
+    L.positionX.value = _a.x; L.positionY.value = _a.y; L.positionZ.value = _a.z;
+    L.forwardX.value = _b.x; L.forwardY.value = _b.y; L.forwardZ.value = _b.z;
+    L.upX.value = 0; L.upY.value = 1; L.upZ.value = 0;
+  } else { L.setPosition(_a.x, _a.y, _a.z); L.setOrientation(_b.x, _b.y, _b.z, 0, 1, 0); }
+}
+
+/* ---------- マウス操作（PC での試用） ---------- */
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2(), dragPlane = new THREE.Plane();
+function setRay(e) {
+  ndc.set((e.clientX / window.innerWidth) * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+}
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (renderer.xr.isPresenting) return;
+  initAudio(); setRay(e);
+  const hit = ray.intersectObjects(items.map((i) => i.mesh), false)[0];
+  if (!hit) return;
+  const h = holders.mouse;
+  camera.getWorldDirection(_a);
+  dragPlane.setFromNormalAndCoplanarPoint(_a, hit.point);
+  h.frame.makeTranslation(hit.point.x, hit.point.y, hit.point.z);
+  beginHold(h, hit.object.userData.item); h.active = true;
+  renderer.domElement.setPointerCapture(e.pointerId);
+});
+renderer.domElement.addEventListener('pointermove', (e) => {
+  const h = holders.mouse; if (!h.item) return;
+  setRay(e);
+  if (ray.ray.intersectPlane(dragPlane, _a)) {
+    _a.y = Math.max(_a.y, play.surfaceY + 0.01);
+    h.frame.makeTranslation(_a.x, _a.y, _a.z);
+  }
+});
+const mouseUp = () => { const h = holders.mouse; if (h.item) endHold(h); h.active = false; };
+renderer.domElement.addEventListener('pointerup', mouseUp);
+renderer.domElement.addEventListener('pointercancel', mouseUp);
+
+/* ---------- XR セッション ---------- */
+const startBtn = document.getElementById('start'), statusEl = document.getElementById('status');
+let xrSession = null;
+(async () => {
+  if (!navigator.xr) {
+    statusEl.textContent = window.isSecureContext
+      ? 'このブラウザは WebXR に対応していません。Quest 3 のブラウザで開いてください。'
+      : 'HTTPS で開いていないため WebXR が使えません。https:// の URL で開いてください。';
+    return;
+  }
+  const ok = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+  if (ok) { startBtn.disabled = false; statusEl.textContent = '準備できました。ボタンを押すとパススルー表示に切り替わります。'; }
+  else statusEl.textContent = 'この端末は MR（immersive-ar）に対応していません。Quest 3 のブラウザで開いてください。';
+})();
+startBtn.addEventListener('click', async () => {
+  if (xrSession) { xrSession.end(); return; }
+  initAudio();
+  try {
+    const session = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['local-floor'],
+      optionalFeatures: ['hand-tracking', 'plane-detection'],
+    });
+    xrSession = session;
+    session.addEventListener('end', () => {
+      xrSession = null; clearPlanes();
+      for (const k of ['left', 'right']) { if (holders[k].item) endHold(holders[k]); holders[k].active = false; hands[k].group.visible = false; }
+      scene.background = DESKTOP_BG; startBtn.textContent = 'MR を開始';
+      camera.position.set(0, 1.28, 0.8); camera.lookAt(0, 0.76, 0);
+      setupDesktop();
+    });
+    scene.background = null;
+    await renderer.xr.setSession(session);
+    startBtn.textContent = 'MR を終了';
+    setTable(null);
+    for (const it of items) { it.body.position.set(0, -20, 0); it.body.sleep(); }
+    setTimeout(() => { if (xrSession === session) respawnXR(); }, 1800);  // 面の検出を少し待ってから配置
+  } catch (err) {
+    statusEl.textContent = 'MR を開始できませんでした：' + (err && err.message ? err.message : err);
+  }
+});
+
+/* ---------- メインループ ---------- */
+window.addEventListener('resize', () => {
+  if (renderer.xr.isPresenting) return;
+  camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+setupDesktop();
+let last = performance.now();
+renderer.setAnimationLoop((time, frame) => {
+  const now = performance.now();
+  const dt = Math.min(1 / 30, Math.max(1 / 240, (now - last) / 1000)); last = now;
+
+  if (frame && xrSession) {
+    const ref = renderer.xr.getReferenceSpace();
+    if (ref) { updatePlanes(frame, ref); updateInputs(frame, ref, dt, now); }
+  }
+  for (const k in holders) if (holders[k].item) driveHeld(holders[k], dt, now);
+
+  world.step(1 / 120, dt, 6);
+
+  camera.getWorldPosition(_head);
+  items.forEach((it, i) => {
+    const b = it.body;
+    const sp = b.velocity.length(); if (sp > 20) b.velocity.scale(20 / sp, b.velocity);
+    if (!it.heldBy && b.position.y > -15) {
+      const dx = b.position.x - _head.x, dz = b.position.z - _head.z;
+      if (b.position.y < -1 || dx * dx + dz * dz > 25) placeOne(it, i, items.length);   // 遠くへ行ったら手元に戻す
+    }
+    it.mesh.position.set(b.position.x, b.position.y, b.position.z);
+    it.mesh.quaternion.set(b.quaternion.x, b.quaternion.y, b.quaternion.z, b.quaternion.w);
+  });
+  updateListener();
+  renderer.render(scene, camera);
+});
+
+window.__lab = { items, world, holders, play };
+</script>
+</body>
+</html>
